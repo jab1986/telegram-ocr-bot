@@ -421,6 +421,14 @@ async function searchMatch(team, opponent, extractedDate = null) {
             return sportsDbMatch;
         }
         
+        // Try Brave Search for lower league results
+        console.log('Trying Brave Search for lower league results...');
+        const braveMatch = await searchBrave(team, opponent, extractedDate);
+        if (braveMatch) {
+            console.log(`Found via Brave Search: ${braveMatch.homeTeam} vs ${braveMatch.awayTeam}`);
+            return braveMatch;
+        }
+        
         // Fallback with known recent results for testing
         const knownResults = getKnownResults(team, opponent);
         if (knownResults) {
@@ -433,6 +441,115 @@ async function searchMatch(team, opponent, extractedDate = null) {
         
     } catch (error) {
         console.error('Goal.com search error:', error);
+        return null;
+    }
+}
+
+async function searchBrave(team, opponent, matchDate) {
+    try {
+        // Construct specific search query
+        let query = `${team} vs ${opponent} football result score`;
+        
+        if (matchDate) {
+            // Add date to search query for more specific results
+            const date = new Date(matchDate);
+            const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
+            const monthName = date.toLocaleDateString('en-US', { month: 'long' });
+            const day = date.getDate();
+            const year = date.getFullYear();
+            
+            query += ` ${day} ${monthName} ${year}`;
+        }
+        
+        console.log(`Brave Search query: ${query}`);
+        
+        const searchParams = new URLSearchParams({
+            q: query,
+            count: '10',
+            search_lang: 'en',
+            country: 'GB',
+            safesearch: 'off',
+            freshness: 'pw' // Past week for recent results
+        });
+        
+        const response = await fetch(`https://api.search.brave.com/res/v1/web/search?${searchParams}`, {
+            method: 'GET',
+            headers: {
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip',
+                'X-Subscription-Token': 'BSA7DmfCgYe3E72WqMVdkuZmkj51W3v'
+            }
+        });
+        
+        if (!response.ok) {
+            console.error(`Brave API error: ${response.status}`);
+            return null;
+        }
+        
+        const data = await response.json();
+        
+        if (!data.web || !data.web.results) {
+            console.log('No Brave search results found');
+            return null;
+        }
+        
+        // Look for results with score information
+        for (const result of data.web.results) {
+            const title = result.title?.toLowerCase() || '';
+            const description = result.description?.toLowerCase() || '';
+            const content = `${title} ${description}`;
+            
+            // Look for score patterns in search results
+            const scorePattern = /(\d{1,2})-(\d{1,2})/g;
+            const scoreMatches = content.match(scorePattern);
+            
+            if (scoreMatches) {
+                // Validate teams are mentioned
+                const teamNorm = normalizeTeamName(team);
+                const opponentNorm = opponent ? normalizeTeamName(opponent) : null;
+                
+                const teamInContent = teamNorm.split(' ').some(part => 
+                    part.length > 2 && content.includes(part)
+                );
+                
+                let opponentInContent = true;
+                if (opponentNorm) {
+                    opponentInContent = opponentNorm.split(' ').some(part => 
+                        part.length > 2 && content.includes(part)
+                    );
+                }
+                
+                if (teamInContent && opponentInContent) {
+                    // Extract the most likely score
+                    const score = scoreMatches[0];
+                    const [homeScore, awayScore] = score.split('-').map(s => parseInt(s));
+                    
+                    if (isValidScore(score)) {
+                        let winner = 'DRAW';
+                        if (homeScore > awayScore) winner = 'HOME';
+                        else if (awayScore > homeScore) winner = 'AWAY';
+                        
+                        // Try to determine which team is home/away from content
+                        let homeTeam = team;
+                        let awayTeam = opponent || 'Unknown';
+                        
+                        return {
+                            homeTeam,
+                            awayTeam,
+                            score,
+                            winner,
+                            status: 'FINISHED',
+                            source: 'Brave Search',
+                            confidence: 'medium'
+                        };
+                    }
+                }
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Brave Search error:', error);
         return null;
     }
 }
