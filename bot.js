@@ -160,6 +160,43 @@ bot.on('document', async (msg) => {
     }
 });
 
+function parseMatchDate(dateString) {
+    try {
+        // Handle different date formats
+        let parsedDate = null;
+        
+        // Format: dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy
+        const ddmmyyyyMatch = dateString.match(/(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
+        if (ddmmyyyyMatch) {
+            const [, day, month, year] = ddmmyyyyMatch;
+            const fullYear = year.length === 2 ? `20${year}` : year;
+            parsedDate = new Date(fullYear, month - 1, day);
+        }
+        
+        // Format: dd Mon yyyy (e.g., "13 Jan 2024")
+        const ddMonYYYYMatch = dateString.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{2,4})/i);
+        if (ddMonYYYYMatch) {
+            const [, day, monthStr, year] = ddMonYYYYMatch;
+            const monthNames = {
+                'jan': 0, 'feb': 1, 'mar': 2, 'apr': 3, 'may': 4, 'jun': 5,
+                'jul': 6, 'aug': 7, 'sep': 8, 'oct': 9, 'nov': 10, 'dec': 11
+            };
+            const month = monthNames[monthStr.toLowerCase().substr(0, 3)];
+            const fullYear = year.length === 2 ? `20${year}` : year;
+            parsedDate = new Date(fullYear, month, day);
+        }
+        
+        if (parsedDate && !isNaN(parsedDate.getTime())) {
+            return parsedDate.toISOString().split('T')[0]; // Return YYYY-MM-DD format
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error parsing date:', error);
+        return null;
+    }
+}
+
 function downloadFile(url) {
     return new Promise((resolve, reject) => {
         https.get(url, (response) => {
@@ -189,7 +226,8 @@ function analyzeBettingSlip(text) {
         toReturn: null,
         boost: null,
         betType: null,
-        odds: null
+        odds: null,
+        matchDate: null
     };
     
     const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
@@ -203,6 +241,20 @@ function analyzeBettingSlip(text) {
             if (line.includes('Bet Ref')) {
                 const match = line.match(/Bet Ref ([A-Z0-9]+)/i);
                 if (match) analysis.betRef = match[1];
+            }
+            
+            // Extract date - look for various date formats
+            const dateMatch = line.match(/(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})|(\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4})/i);
+            if (dateMatch) {
+                analysis.matchDate = parseMatchDate(dateMatch[0]);
+            }
+            
+            // Also check for "Bet Placed" with date/time
+            if (line.includes('Bet Placed')) {
+                const betDateMatch = line.match(/Bet Placed.*?(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})/i);
+                if (betDateMatch) {
+                    analysis.matchDate = parseMatchDate(betDateMatch[1]);
+                }
             }
             
             if (line.includes('To Return')) {
@@ -263,7 +315,7 @@ function analyzeBettingSlip(text) {
 async function fetchMatchResults(analysis) {
     for (let selection of analysis.selections) {
         try {
-            const matchData = await searchMatch(selection.team, selection.opponent);
+            const matchData = await searchMatch(selection.team, selection.opponent, analysis.matchDate);
             if (matchData) {
                 selection.result = determineResult(matchData, selection.team, selection.market);
                 selection.score = matchData.score;
@@ -280,16 +332,30 @@ async function fetchMatchResults(analysis) {
     }
 }
 
-async function searchMatch(team, opponent) {
+async function searchMatch(team, opponent, extractedDate = null) {
     try {
-        console.log(`Searching goal.com for: ${team} vs ${opponent}`);
+        console.log(`Searching for: ${team} vs ${opponent}${extractedDate ? ` on ${extractedDate}` : ''}`);
         
-        // Search wider date range (last 30 days to catch older fixtures)
+        // Use extracted date if available, otherwise search wider range
         const dates = [];
-        for (let i = 0; i < 30; i++) {
-            const date = new Date();
-            date.setDate(date.getDate() - i);
-            dates.push(date.toISOString().split('T')[0]);
+        if (extractedDate) {
+            // Check exact date first, then ±3 days around it
+            dates.push(extractedDate);
+            for (let i = 1; i <= 3; i++) {
+                const beforeDate = new Date(extractedDate);
+                beforeDate.setDate(beforeDate.getDate() - i);
+                const afterDate = new Date(extractedDate);
+                afterDate.setDate(afterDate.getDate() + i);
+                dates.push(beforeDate.toISOString().split('T')[0]);
+                dates.push(afterDate.toISOString().split('T')[0]);
+            }
+        } else {
+            // Fallback: search last 30 days
+            for (let i = 0; i < 30; i++) {
+                const date = new Date();
+                date.setDate(date.getDate() - i);
+                dates.push(date.toISOString().split('T')[0]);
+            }
         }
         
         for (const searchDate of dates) {
@@ -347,6 +413,14 @@ async function searchMatch(team, opponent) {
             }
         }
         
+        // Try TheSportsDB as backup API
+        console.log('Trying TheSportsDB as backup...');
+        const sportsDbMatch = await searchTheSportsDB(team, opponent, extractedDate);
+        if (sportsDbMatch) {
+            console.log(`Found on TheSportsDB: ${sportsDbMatch.homeTeam} vs ${sportsDbMatch.awayTeam}`);
+            return sportsDbMatch;
+        }
+        
         // Fallback with known recent results for testing
         const knownResults = getKnownResults(team, opponent);
         if (knownResults) {
@@ -354,11 +428,81 @@ async function searchMatch(team, opponent) {
             return knownResults;
         }
         
-        console.log('No match found on goal.com');
+        console.log('No match found across all sources');
         return null;
         
     } catch (error) {
         console.error('Goal.com search error:', error);
+        return null;
+    }
+}
+
+async function searchTheSportsDB(team, opponent, matchDate) {
+    try {
+        // TheSportsDB free API - search for recent matches
+        const normalizedTeam = normalizeTeamName(team);
+        
+        // Try searching by team name (free API limit)
+        const searchUrl = `https://www.thesportsdb.com/api/v1/json/3/searchteams.php?t=${encodeURIComponent(team)}`;
+        
+        const response = await fetch(searchUrl);
+        if (!response.ok) return null;
+        
+        const data = await response.json();
+        if (!data.teams || data.teams.length === 0) return null;
+        
+        const teamId = data.teams[0].idTeam;
+        
+        // Get recent events for the team
+        const eventsUrl = `https://www.thesportsdb.com/api/v1/json/3/eventslast.php?id=${teamId}`;
+        const eventsResponse = await fetch(eventsUrl);
+        if (!eventsResponse.ok) return null;
+        
+        const eventsData = await eventsResponse.json();
+        if (!eventsData.results) return null;
+        
+        // Look for matches involving the opponent
+        for (const event of eventsData.results) {
+            if (event.strSport !== 'Soccer') continue;
+            
+            const homeTeam = event.strHomeTeam;
+            const awayTeam = event.strAwayTeam;
+            
+            // Check if this match involves both teams
+            const homeNorm = normalizeTeamName(homeTeam);
+            const awayNorm = normalizeTeamName(awayTeam);
+            const opponentNorm = opponent ? normalizeTeamName(opponent) : null;
+            
+            let isMatch = false;
+            if (opponentNorm) {
+                isMatch = (homeNorm.includes(normalizedTeam) && awayNorm.includes(opponentNorm)) ||
+                         (homeNorm.includes(opponentNorm) && awayNorm.includes(normalizedTeam));
+            } else {
+                isMatch = homeNorm.includes(normalizedTeam) || awayNorm.includes(normalizedTeam);
+            }
+            
+            if (isMatch && event.intHomeScore !== null && event.intAwayScore !== null) {
+                const homeScore = parseInt(event.intHomeScore);
+                const awayScore = parseInt(event.intAwayScore);
+                
+                let winner = 'DRAW';
+                if (homeScore > awayScore) winner = 'HOME';
+                else if (awayScore > homeScore) winner = 'AWAY';
+                
+                return {
+                    homeTeam,
+                    awayTeam,
+                    score: `${homeScore}-${awayScore}`,
+                    winner,
+                    status: 'FINISHED',
+                    source: 'TheSportsDB'
+                };
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('TheSportsDB error:', error);
         return null;
     }
 }
@@ -594,7 +738,7 @@ function parseGoalComResults(html, searchTeam, searchOpponent) {
                     }
                 }
                 
-                if (score) { // Only add matches with scores (completed)
+                if (score && isValidScore(score)) { // Only add matches with valid scores
                     matches.push({
                         homeTeam,
                         awayTeam,
@@ -633,6 +777,20 @@ function parseGoalComResults(html, searchTeam, searchOpponent) {
     }
 }
 
+
+function isValidScore(score) {
+    // Check if score matches format "X-Y" where X and Y are numbers 0-20
+    const scorePattern = /^(\d{1,2})-(\d{1,2})$/;
+    const match = score.match(scorePattern);
+    
+    if (!match) return false;
+    
+    const homeScore = parseInt(match[1]);
+    const awayScore = parseInt(match[2]);
+    
+    // Reasonable score validation (0-20 goals per team)
+    return homeScore >= 0 && homeScore <= 20 && awayScore >= 0 && awayScore <= 20;
+}
 
 function normalizeTeamName(name) {
     return name.toLowerCase()
@@ -679,6 +837,10 @@ function formatBettingSlipResponse(analysis) {
     
     if (analysis.betRef) {
         response += `📋 *Bet Reference:* \`${analysis.betRef}\`\n`;
+    }
+    
+    if (analysis.matchDate) {
+        response += `📅 *Match Date:* ${analysis.matchDate}\n`;
     }
     
     if (analysis.betType && analysis.odds) {
