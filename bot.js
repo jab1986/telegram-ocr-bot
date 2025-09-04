@@ -320,6 +320,8 @@ async function fetchMatchResults(analysis) {
                 selection.result = determineResult(matchData, selection.team, selection.market);
                 selection.score = matchData.score;
                 selection.status = matchData.status;
+                selection.source = matchData.source;
+                selection.confidence = matchData.confidence;
             } else {
                 selection.result = 'unknown';
                 selection.status = 'not_found';
@@ -447,19 +449,30 @@ async function searchMatch(team, opponent, extractedDate = null) {
 
 async function searchBrave(team, opponent, matchDate) {
     try {
-        // Construct specific search query
-        let query = `${team} vs ${opponent} football result score`;
+        // Construct specific search query with improved accuracy
+        let query = '';
+        
+        if (opponent) {
+            // Full match query if we know both teams
+            query = `"${team}" vs "${opponent}" football result score`;
+        } else {
+            // Single team query if opponent unknown
+            query = `"${team}" football result score`;
+        }
         
         if (matchDate) {
             // Add date to search query for more specific results
             const date = new Date(matchDate);
-            const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
             const monthName = date.toLocaleDateString('en-US', { month: 'long' });
             const day = date.getDate();
             const year = date.getFullYear();
             
-            query += ` ${day} ${monthName} ${year}`;
+            // Add multiple date formats to catch more results
+            query += ` "${day} ${monthName} ${year}" OR "${matchDate}"`;
         }
+        
+        // Add site restriction to improve accuracy
+        query += ' site:bbc.co.uk OR site:skysports.com OR site:efl.com OR site:flashscore.com';
         
         console.log(`Brave Search query: ${query}`);
         
@@ -497,51 +510,92 @@ async function searchBrave(team, opponent, matchDate) {
         for (const result of data.web.results) {
             const title = result.title?.toLowerCase() || '';
             const description = result.description?.toLowerCase() || '';
+            const url = result.url?.toLowerCase() || '';
             const content = `${title} ${description}`;
             
-            // Look for score patterns in search results
-            const scorePattern = /(\d{1,2})-(\d{1,2})/g;
-            const scoreMatches = content.match(scorePattern);
+            console.log(`Checking search result: ${result.title}`);
             
-            if (scoreMatches) {
-                // Validate teams are mentioned
-                const teamNorm = normalizeTeamName(team);
-                const opponentNorm = opponent ? normalizeTeamName(opponent) : null;
+            // Only consider results from reliable sports sites
+            const reliableSites = ['bbc.co.uk/sport', 'skysports.com', 'espn.co.uk', 
+                                 'football-league.co.uk', 'efl.com', 'flashscore.com',
+                                 'livescore.com', 'goal.com', 'transfermarkt'];
+            
+            const isReliableSite = reliableSites.some(site => url.includes(site));
+            
+            if (!isReliableSite) {
+                console.log('Skipping unreliable site');
+                continue;
+            }
+            
+            // Look for score patterns with context
+            const scoreWithContext = content.match(/(\w+)\s+(\d{1,2})-(\d{1,2})\s+(\w+)/g);
+            const simpleScore = content.match(/(\d{1,2})-(\d{1,2})/g);
+            
+            if (scoreWithContext || simpleScore) {
+                const scores = scoreWithContext || simpleScore;
                 
-                const teamInContent = teamNorm.split(' ').some(part => 
-                    part.length > 2 && content.includes(part)
-                );
-                
-                let opponentInContent = true;
-                if (opponentNorm) {
-                    opponentInContent = opponentNorm.split(' ').some(part => 
-                        part.length > 2 && content.includes(part)
-                    );
-                }
-                
-                if (teamInContent && opponentInContent) {
-                    // Extract the most likely score
-                    const score = scoreMatches[0];
-                    const [homeScore, awayScore] = score.split('-').map(s => parseInt(s));
+                for (const scoreMatch of scores) {
+                    // Extract team names from context around score
+                    let contextTeams = [];
+                    if (scoreWithContext) {
+                        const parts = scoreMatch.split(/\d{1,2}-\d{1,2}/);
+                        if (parts.length >= 2) {
+                            contextTeams = [parts[0].trim(), parts[1].trim()];
+                        }
+                    }
                     
-                    if (isValidScore(score)) {
-                        let winner = 'DRAW';
-                        if (homeScore > awayScore) winner = 'HOME';
-                        else if (awayScore > homeScore) winner = 'AWAY';
+                    // Validate teams are mentioned in result
+                    const teamNorm = normalizeTeamName(team);
+                    const opponentNorm = opponent ? normalizeTeamName(opponent) : null;
+                    
+                    let teamMatch = false;
+                    let opponentMatch = true; // Default true if no opponent specified
+                    
+                    // Check if team appears in content or extracted context
+                    const teamWords = teamNorm.split(' ').filter(word => word.length > 2);
+                    teamMatch = teamWords.some(word => content.includes(word)) ||
+                               contextTeams.some(contextTeam => 
+                                   normalizeTeamName(contextTeam).includes(teamNorm));
+                    
+                    if (opponentNorm) {
+                        const opponentWords = opponentNorm.split(' ').filter(word => word.length > 2);
+                        opponentMatch = opponentWords.some(word => content.includes(word)) ||
+                                       contextTeams.some(contextTeam => 
+                                           normalizeTeamName(contextTeam).includes(opponentNorm));
+                    }
+                    
+                    if (teamMatch && opponentMatch) {
+                        const score = scoreMatch.match(/(\d{1,2})-(\d{1,2})/)[0];
                         
-                        // Try to determine which team is home/away from content
-                        let homeTeam = team;
-                        let awayTeam = opponent || 'Unknown';
-                        
-                        return {
-                            homeTeam,
-                            awayTeam,
-                            score,
-                            winner,
-                            status: 'FINISHED',
-                            source: 'Brave Search',
-                            confidence: 'medium'
-                        };
+                        if (isValidScore(score)) {
+                            const [homeScore, awayScore] = score.split('-').map(s => parseInt(s));
+                            
+                            let winner = 'DRAW';
+                            if (homeScore > awayScore) winner = 'HOME';
+                            else if (awayScore > homeScore) winner = 'AWAY';
+                            
+                            // Try to determine home/away from context
+                            let homeTeam = team;
+                            let awayTeam = opponent || 'Unknown';
+                            
+                            if (contextTeams.length >= 2) {
+                                homeTeam = contextTeams[0];
+                                awayTeam = contextTeams[1];
+                            }
+                            
+                            console.log(`Found reliable result from ${url}: ${homeTeam} ${score} ${awayTeam}`);
+                            
+                            return {
+                                homeTeam,
+                                awayTeam,
+                                score,
+                                winner,
+                                status: 'FINISHED',
+                                source: 'Brave Search',
+                                confidence: 'high',
+                                sourceUrl: result.url
+                            };
+                        }
                     }
                 }
             }
@@ -612,7 +666,8 @@ async function searchTheSportsDB(team, opponent, matchDate) {
                     score: `${homeScore}-${awayScore}`,
                     winner,
                     status: 'FINISHED',
-                    source: 'TheSportsDB'
+                    source: 'TheSportsDB',
+                    confidence: 'high'
                 };
             }
         }
@@ -1012,6 +1067,10 @@ function formatBettingSlipResponse(analysis) {
             
             if (selection.score) {
                 response += ` - Score: ${selection.score}`;
+                // Add source information for transparency
+                if (selection.source && selection.source !== 'Goal.com') {
+                    response += ` (${selection.source})`;
+                }
             }
             
             response += '\n';
