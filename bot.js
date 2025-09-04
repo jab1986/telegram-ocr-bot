@@ -58,11 +58,22 @@ bot.on('photo', async (msg) => {
 
         console.log('🔄 Running OCR...');
         const worker = await createWorker('eng');
-        const { data: { text } } = await worker.recognize(imageBuffer);
+        
+        // Improve OCR accuracy with better configuration
+        await worker.setParameters({
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789£.:/- ',
+            tessedit_pageseg_mode: '6', // Single column of text
+            preserve_interword_spaces: '1'
+        });
+        
+        const { data: { text, confidence } } = await worker.recognize(imageBuffer);
         await worker.terminate();
+        
+        console.log(`OCR confidence: ${confidence}%`);
 
         if (text.trim()) {
             console.log('✅ OCR completed, text extracted');
+            console.log('Raw OCR text:', JSON.stringify(text.trim()));
             
             const betAnalysis = analyzeBettingSlip(text.trim());
             
@@ -119,11 +130,22 @@ bot.on('document', async (msg) => {
 
             console.log('🔄 Running OCR...');
             const worker = await createWorker('eng');
-            const { data: { text } } = await worker.recognize(imageBuffer);
+            
+            // Improve OCR accuracy with better configuration
+            await worker.setParameters({
+                tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789£.:/- ',
+                tessedit_pageseg_mode: '6', // Single column of text
+                preserve_interword_spaces: '1'
+            });
+            
+            const { data: { text, confidence } } = await worker.recognize(imageBuffer);
             await worker.terminate();
+            
+            console.log(`OCR confidence: ${confidence}%`);
 
             if (text.trim()) {
                 console.log('✅ OCR completed, text extracted');
+                console.log('Raw OCR text:', JSON.stringify(text.trim()));
                 
                 const betAnalysis = analyzeBettingSlip(text.trim());
                 
@@ -285,7 +307,14 @@ function analyzeBettingSlip(text) {
                 const odds = parseFloat(parts[parts.length - 1]);
                 const team = parts.slice(0, -1).join(' ');
                 
-                if (odds > 1 && odds < 100) {
+                // Filter out obvious non-team names
+                const invalidTeamNames = ['yes', 'no', 'win', 'lose', 'over', 'under', 'both', 'either', 'any'];
+                const teamNormalized = normalizeTeamName(team);
+                const isValidTeam = !invalidTeamNames.includes(teamNormalized.toLowerCase()) && 
+                                  team.length > 2 && 
+                                  !team.match(/^(yes|no)$/i);
+                
+                if (odds > 1 && odds < 100 && isValidTeam) {
                     let market = 'Unknown';
                     let opponent = null;
                     
