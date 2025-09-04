@@ -35,6 +35,11 @@ bot.onText(/\/ping/, (msg) => {
     bot.sendMessage(chatId, '🏓 Pong! Bot is working.');
 });
 
+bot.onText(/\/debug/, (msg) => {
+    const chatId = msg.chat.id;
+    bot.sendMessage(chatId, '🐛 Debug mode enabled. Send an image to see detailed OCR parsing info.');
+});
+
 bot.on('photo', async (msg) => {
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
@@ -239,6 +244,105 @@ bot.on('polling_error', (error) => {
     console.error('Polling error:', error);
 });
 
+function isAnchor(line) {
+    // Known team names (add more as needed)
+    const knownTeams = [
+        'liverpool', 'manchester', 'chelsea', 'arsenal', 'tottenham', 'newcastle',
+        'barcelona', 'madrid', 'bayern', 'juventus', 'milan', 'inter', 'napoli',
+        'paris', 'psg', 'lyon', 'marseille', 'monaco', 'lille', 'nice',
+        'dortmund', 'leipzig', 'leverkusen', 'frankfurt', 'wolfsburg',
+        'atletico', 'sevilla', 'valencia', 'villarreal', 'betis', 'sociedad',
+        'atalanta', 'roma', 'lazio', 'fiorentina', 'torino', 'bologna',
+        'birmingham', 'coventry', 'cardiff', 'swansea', 'leeds', 'norwich',
+        'leicester', 'brighton', 'crystal', 'west', 'aston', 'villa',
+        'burnley', 'brentford', 'fulham', 'wolves', 'everton', 'southampton',
+        'braga', 'porto', 'sporting', 'benfica', 'vitoria', 'guimaraes'
+    ];
+    
+    // Betting market terms
+    const bettingMarkets = [
+        'yes', 'no', 'draw', 'over', 'under', 'both', 'either', 
+        'home', 'away', 'first', 'last', 'anytime', 'correct'
+    ];
+    
+    const lineNormalized = normalizeTeamName(line.toLowerCase());
+    
+    // Check if line contains known team name
+    const containsTeam = knownTeams.some(team => 
+        lineNormalized.includes(team) || team.includes(lineNormalized)
+    );
+    
+    // Check if line is a betting market term
+    const isBettingMarket = bettingMarkets.some(market => 
+        lineNormalized === market || line.toLowerCase() === market
+    );
+    
+    // Additional validation - must be reasonable length and not contain numbers/odds
+    const hasValidLength = line.length >= 2 && line.length <= 50;
+    const noOddsPattern = !line.match(/^\d+\.\d+$/) && !line.match(/£\d+/);
+    
+    return (containsTeam || isBettingMarket) && hasValidLength && noOddsPattern;
+}
+
+function parseSelectionBlock(blockLines) {
+    if (!blockLines || blockLines.length === 0) return null;
+    
+    const selection = {
+        team: blockLines[0], // Anchor line is always the selection name
+        odds: null,
+        market: 'Unknown',
+        opponent: null
+    };
+    
+    // Extract odds using regex
+    for (const line of blockLines) {
+        const oddsMatch = line.match(/(\d{1,2}\.\d{2})/);
+        if (oddsMatch && !selection.odds) {
+            selection.odds = parseFloat(oddsMatch[1]);
+        }
+    }
+    
+    // Extract fixture (Team A v Team B)
+    for (const line of blockLines) {
+        const fixtureMatch = line.match(/(.+)\s+v\s+(.+)/i);
+        if (fixtureMatch) {
+            const team1 = fixtureMatch[1].trim();
+            const team2 = fixtureMatch[2].trim();
+            
+            // Determine which team is our selection
+            const selectionNorm = normalizeTeamName(selection.team);
+            const team1Norm = normalizeTeamName(team1);
+            const team2Norm = normalizeTeamName(team2);
+            
+            if (team1Norm.includes(selectionNorm) || selectionNorm.includes(team1Norm)) {
+                selection.opponent = team2;
+            } else if (team2Norm.includes(selectionNorm) || selectionNorm.includes(team2Norm)) {
+                selection.opponent = team1;
+            }
+            break;
+        }
+    }
+    
+    // Extract bet type
+    for (const line of blockLines) {
+        if (line.includes('Full Time Result')) {
+            selection.market = 'Full Time Result';
+            break;
+        } else if (line.includes('Double Chance')) {
+            selection.market = 'Double Chance';
+            break;
+        } else if (line.includes('Both Teams')) {
+            selection.market = 'Both Teams To Score';
+            break;
+        } else if (line.includes('Over') || line.includes('Under')) {
+            selection.market = 'Total Goals';
+            break;
+        }
+    }
+    
+    return selection;
+}
+
 function analyzeBettingSlip(text) {
     const analysis = {
         isBettingSlip: false,
@@ -257,6 +361,7 @@ function analyzeBettingSlip(text) {
     if (lines.some(line => line.includes('Bet Ref') || line.includes('Bet Placed') || line.includes('To Return'))) {
         analysis.isBettingSlip = true;
         
+        // Extract basic betting slip information
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             
@@ -301,39 +406,50 @@ function analyzeBettingSlip(text) {
                     analysis.odds = parseFloat(match[2]);
                 }
             }
+        }
+        
+        // NEW BLOCK-BASED PARSING LOGIC
+        console.log('🔄 Using anchor-based parsing for selections...');
+        
+        const selectionBlocks = [];
+        let currentBlock = [];
+        
+        // Group lines into blocks based on anchors
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
             
-            if (line.match(/^[A-Za-z\s]+ [0-9.]+$/)) {
-                const parts = line.split(' ');
-                const odds = parseFloat(parts[parts.length - 1]);
-                const team = parts.slice(0, -1).join(' ');
-                
-                // Filter out obvious non-team names
-                const invalidTeamNames = ['yes', 'no', 'win', 'lose', 'over', 'under', 'both', 'either', 'any'];
-                const teamNormalized = normalizeTeamName(team);
-                const isValidTeam = !invalidTeamNames.includes(teamNormalized.toLowerCase()) && 
-                                  team.length > 2 && 
-                                  !team.match(/^(yes|no)$/i);
-                
-                if (odds > 1 && odds < 100 && isValidTeam) {
-                    let market = 'Unknown';
-                    let opponent = null;
-                    
-                    if (i + 1 < lines.length) {
-                        const nextLine = lines[i + 1];
-                        if (nextLine.includes('Full Time Result')) {
-                            market = 'Full Time Result';
-                        }
-                        
-                        const vsMatch = nextLine.match(/([A-Za-z\s]+) v ([A-Za-z\s]+)/);
-                        if (vsMatch) {
-                            const team1 = vsMatch[1].trim();
-                            const team2 = vsMatch[2].trim();
-                            opponent = normalizeTeamName(team1) === normalizeTeamName(team) ? team2 : team1;
-                        }
-                    }
-                    
-                    analysis.selections.push({ team, odds, market, opponent });
+            if (isAnchor(line)) {
+                // Process previous block if it exists
+                if (currentBlock.length > 0) {
+                    selectionBlocks.push([...currentBlock]);
                 }
+                // Start new block with this anchor
+                currentBlock = [line];
+                console.log(`📍 Found anchor: "${line}"`);
+            } else {
+                // Add line to current block if we have an active block
+                if (currentBlock.length > 0) {
+                    currentBlock.push(line);
+                }
+            }
+        }
+        
+        // Don't forget the last block
+        if (currentBlock.length > 0) {
+            selectionBlocks.push(currentBlock);
+        }
+        
+        console.log(`🔍 Found ${selectionBlocks.length} selection blocks`);
+        
+        // Parse each block into a selection
+        for (const block of selectionBlocks) {
+            console.log(`📦 Processing block: ${JSON.stringify(block)}`);
+            const selection = parseSelectionBlock(block);
+            if (selection && selection.odds) {
+                analysis.selections.push(selection);
+                console.log(`✅ Parsed selection: ${selection.team} @ ${selection.odds}`);
+            } else {
+                console.log(`❌ Failed to parse block: ${JSON.stringify(block)}`);
             }
         }
     }
