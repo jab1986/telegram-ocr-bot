@@ -1,3 +1,4 @@
+require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { createWorker } = require('tesseract.js');
 const fs = require('fs');
@@ -6,11 +7,16 @@ const { fetch } = require('undici');
 const cheerio = require('cheerio');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
+const footballApiKey = process.env.FOOTBALL_API_KEY;
 
 if (!token) {
     console.error('❌ TELEGRAM_BOT_TOKEN environment variable is required');
     console.log('Get your token from @BotFather on Telegram');
     process.exit(1);
+}
+
+if (!footballApiKey) {
+    console.warn('⚠️  FOOTBALL_API_KEY not found - Football API features will be disabled');
 }
 
 const bot = new TelegramBot(token, { polling: true });
@@ -505,6 +511,16 @@ async function searchMatch(team, opponent, extractedDate = null) {
             }
         }
         
+        // Try Football API first (highest priority - most reliable)
+        if (footballApiKey) {
+            console.log('🥇 Trying Football API (Primary source)...');
+            const footballApiMatch = await searchFootballAPI(team, opponent, extractedDate);
+            if (footballApiMatch) {
+                console.log(`✅ Found on Football API: ${footballApiMatch.homeTeam} vs ${footballApiMatch.awayTeam}`);
+                return footballApiMatch;
+            }
+        }
+        
         for (const searchDate of dates) {
             console.log(`Checking fixtures for ${searchDate}...`);
             
@@ -821,6 +837,296 @@ async function searchTheSportsDB(team, opponent, matchDate) {
     } catch (error) {
         console.error('TheSportsDB error:', error);
         return null;
+    }
+}
+
+async function searchFootballAPI(team, opponent, matchDate) {
+    try {
+        console.log(`🔍 Football API: Searching for ${team}${opponent ? ` vs ${opponent}` : ''}${matchDate ? ` on ${matchDate}` : ''}`);
+        
+        const normalizedTeam = normalizeTeamName(team);
+        let teamId = null;
+        let opponentId = null;
+        
+        // Enhanced team search with multiple approaches
+        teamId = await findTeamIdBySearch(team);
+        if (opponent) {
+            opponentId = await findTeamIdBySearch(opponent);
+        }
+        
+        if (!teamId) {
+            console.log('❌ Football API: Team not found');
+            return null;
+        }
+        
+        console.log(`✅ Football API: Found team ID ${teamId}${opponentId ? ` and opponent ID ${opponentId}` : ''}`);
+        
+        // Enhanced fixture search with multiple strategies
+        let match = null;
+        
+        // Strategy 1: Search by specific date if provided
+        if (matchDate) {
+            match = await searchFixturesByDate(teamId, opponentId, matchDate, normalizedTeam, opponent);
+        }
+        
+        // Strategy 2: Search recent fixtures (last 30 days)
+        if (!match) {
+            match = await searchRecentFixtures(teamId, opponentId, normalizedTeam, opponent);
+        }
+        
+        // Strategy 3: Search by fixture ID if we have both teams
+        if (!match && opponentId) {
+            match = await searchFixturesByTeams(teamId, opponentId, normalizedTeam, opponent);
+        }
+        
+        return match;
+        
+    } catch (error) {
+        console.error('❌ Football API error:', error);
+        
+        // Enhanced error handling
+        if (error.message.includes('429')) {
+            console.warn('⚠️ Football API rate limit exceeded');
+        } else if (error.message.includes('401')) {
+            console.warn('⚠️ Football API authentication failed - check API key');
+        } else if (error.message.includes('403')) {
+            console.warn('⚠️ Football API access forbidden - check subscription plan');
+        }
+        
+        return null;
+    }
+}
+
+async function findTeamIdBySearch(teamName) {
+    try {
+        // Primary search by team name
+        const searchUrl = `https://v3.football.api-sports.io/teams?search=${encodeURIComponent(teamName)}`;
+        
+        const response = await makeFootballAPIRequest(searchUrl);
+        if (!response) return null;
+        
+        const data = await response.json();
+        
+        if (data.response && data.response.length > 0) {
+            // Find best match by name similarity
+            const normalizedSearch = normalizeTeamName(teamName);
+            let bestMatch = data.response[0];
+            
+            for (const teamData of data.response) {
+                const teamNorm = normalizeTeamName(teamData.team.name);
+                if (teamNorm.includes(normalizedSearch) || normalizedSearch.includes(teamNorm)) {
+                    bestMatch = teamData;
+                    break;
+                }
+            }
+            
+            console.log(`🎯 Football API: Matched "${teamName}" to "${bestMatch.team.name}" (ID: ${bestMatch.team.id})`);
+            return bestMatch.team.id;
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error in team search:', error);
+        return null;
+    }
+}
+
+async function searchFixturesByDate(teamId, opponentId, matchDate, normalizedTeam, opponent) {
+    try {
+        // Search fixtures for specific date ±2 days
+        const searchDate = new Date(matchDate);
+        const dates = [];
+        
+        // Add target date and ±2 days around it
+        for (let i = -2; i <= 2; i++) {
+            const date = new Date(searchDate);
+            date.setDate(searchDate.getDate() + i);
+            dates.push(date.toISOString().split('T')[0]);
+        }
+        
+        for (const date of dates) {
+            const fixturesUrl = `https://v3.football.api-sports.io/fixtures?team=${teamId}&date=${date}`;
+            const response = await makeFootballAPIRequest(fixturesUrl);
+            
+            if (!response) continue;
+            const data = await response.json();
+            
+            if (data.response && data.response.length > 0) {
+                const match = findMatchingFixture(data.response, normalizedTeam, opponent, opponentId);
+                if (match) {
+                    console.log(`📅 Football API: Found match on ${date}`);
+                    return match;
+                }
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error in date-based fixture search:', error);
+        return null;
+    }
+}
+
+async function searchRecentFixtures(teamId, opponentId, normalizedTeam, opponent) {
+    try {
+        const currentDate = new Date();
+        const pastDate = new Date(currentDate.getTime() - (30 * 24 * 60 * 60 * 1000)); // 30 days ago
+        
+        const fixturesUrl = `https://v3.football.api-sports.io/fixtures?team=${teamId}&from=${pastDate.toISOString().split('T')[0]}&to=${currentDate.toISOString().split('T')[0]}&status=FT`;
+        
+        const response = await makeFootballAPIRequest(fixturesUrl);
+        if (!response) return null;
+        
+        const data = await response.json();
+        
+        if (data.response && data.response.length > 0) {
+            const match = findMatchingFixture(data.response, normalizedTeam, opponent, opponentId);
+            if (match) {
+                console.log(`📊 Football API: Found match in recent fixtures`);
+                return match;
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error in recent fixtures search:', error);
+        return null;
+    }
+}
+
+async function searchFixturesByTeams(teamId, opponentId, normalizedTeam, opponent) {
+    try {
+        // Search head-to-head fixtures
+        const h2hUrl = `https://v3.football.api-sports.io/fixtures/headtohead?h2h=${teamId}-${opponentId}`;
+        
+        const response = await makeFootballAPIRequest(h2hUrl);
+        if (!response) return null;
+        
+        const data = await response.json();
+        
+        if (data.response && data.response.length > 0) {
+            // Find most recent finished match
+            const finishedMatches = data.response.filter(fixture => 
+                fixture.fixture.status.short === 'FT' && 
+                fixture.goals.home !== null && 
+                fixture.goals.away !== null
+            );
+            
+            if (finishedMatches.length > 0) {
+                // Sort by date (most recent first)
+                finishedMatches.sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date));
+                
+                const fixture = finishedMatches[0];
+                console.log(`🆚 Football API: Found H2H match`);
+                
+                return createMatchResult(fixture);
+            }
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Error in head-to-head fixture search:', error);
+        return null;
+    }
+}
+
+function findMatchingFixture(fixtures, normalizedTeam, opponent, opponentId) {
+    for (const fixture of fixtures) {
+        // Only process finished matches with scores
+        if (fixture.fixture.status.short !== 'FT' || 
+            fixture.goals.home === null || 
+            fixture.goals.away === null) {
+            continue;
+        }
+        
+        const homeTeam = fixture.teams.home.name;
+        const awayTeam = fixture.teams.away.name;
+        const homeNorm = normalizeTeamName(homeTeam);
+        const awayNorm = normalizeTeamName(awayTeam);
+        
+        let isMatch = false;
+        
+        if (opponent) {
+            const opponentNorm = normalizeTeamName(opponent);
+            
+            // Check if both teams match
+            isMatch = (homeNorm.includes(normalizedTeam) && awayNorm.includes(opponentNorm)) ||
+                     (homeNorm.includes(opponentNorm) && awayNorm.includes(normalizedTeam)) ||
+                     (opponentId && (fixture.teams.home.id === opponentId || fixture.teams.away.id === opponentId));
+        } else {
+            // Single team match
+            isMatch = homeNorm.includes(normalizedTeam) || awayNorm.includes(normalizedTeam);
+        }
+        
+        if (isMatch) {
+            return createMatchResult(fixture);
+        }
+    }
+    
+    return null;
+}
+
+function createMatchResult(fixture) {
+    const homeTeam = fixture.teams.home.name;
+    const awayTeam = fixture.teams.away.name;
+    const homeScore = fixture.goals.home;
+    const awayScore = fixture.goals.away;
+    
+    let winner = 'DRAW';
+    if (homeScore > awayScore) winner = 'HOME';
+    else if (awayScore > homeScore) winner = 'AWAY';
+    
+    return {
+        homeTeam,
+        awayTeam,
+        score: `${homeScore}-${awayScore}`,
+        winner,
+        status: 'FINISHED',
+        source: 'Football API',
+        confidence: 'very_high',
+        matchDate: fixture.fixture.date.split('T')[0],
+        league: fixture.league.name,
+        leagueId: fixture.league.id,
+        fixtureId: fixture.fixture.id,
+        venue: fixture.fixture.venue ? fixture.fixture.venue.name : null
+    };
+}
+
+async function makeFootballAPIRequest(url) {
+    try {
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'X-RapidAPI-Key': footballApiKey,
+                'X-RapidAPI-Host': 'v3.football.api-sports.io'
+            }
+        });
+        
+        // Enhanced error handling
+        if (response.status === 429) {
+            console.warn('⚠️ Football API rate limit exceeded - waiting before retry');
+            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+            return null;
+        }
+        
+        if (response.status === 401) {
+            throw new Error('401: Football API authentication failed');
+        }
+        
+        if (response.status === 403) {
+            throw new Error('403: Football API access forbidden');
+        }
+        
+        if (!response.ok) {
+            console.error(`Football API HTTP error: ${response.status} ${response.statusText}`);
+            return null;
+        }
+        
+        return response;
+        
+    } catch (error) {
+        console.error('Football API request error:', error);
+        throw error;
     }
 }
 
@@ -1212,9 +1518,16 @@ function formatBettingSlipResponse(analysis) {
             
             if (selection.score) {
                 response += ` - Score: ${selection.score}`;
-                // Add source information for transparency
-                if (selection.source && selection.source !== 'Goal.com') {
-                    response += ` (${selection.source})`;
+                // Add enhanced source information for transparency
+                if (selection.source) {
+                    response += ` (${selection.source}`;
+                    if (selection.confidence && selection.confidence === 'very_high') {
+                        response += ' ✨';
+                    }
+                    if (selection.league) {
+                        response += ` - ${selection.league}`;
+                    }
+                    response += ')';
                 }
             }
             

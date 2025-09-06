@@ -1,0 +1,412 @@
+# CI/CD Pipeline for Telegram OCR Betting Slip Bot
+# Comprehensive testing and quality assurance workflow
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * 1' # Weekly dependency check on Mondays at 2 AM
+
+env:
+  NODE_VERSION: '18.x'
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || 'test_token_123456789' }}
+  FOOTBALL_API_KEY: ${{ secrets.FOOTBALL_API_KEY || 'test_football_api_key' }}
+  BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY || 'test_brave_api_key' }}
+
+jobs:
+  # Job 1: Dependency and Security Audit
+  security-audit:
+    name: Security & Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security audit
+        run: npm audit --audit-level=moderate
+
+      - name: Check for outdated packages
+        run: npm outdated || exit 0
+
+      - name: Validate package-lock.json
+        run: npm ci --dry-run
+
+  # Job 2: Code Quality and Linting
+  code-quality:
+    name: Code Quality & Linting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Check code formatting (if prettier configured)
+        run: |
+          if [ -f .prettierrc ] || [ -f .prettierrc.json ] || [ -f .prettierrc.js ]; then
+            npx prettier --check .
+          else
+            echo "Prettier not configured, skipping formatting check"
+          fi
+
+      - name: Validate JSON files
+        run: |
+          find . -name "*.json" -not -path "./node_modules/*" -exec sh -c '
+            for file do
+              echo "Validating $file"
+              cat "$file" | python -m json.tool > /dev/null || exit 1
+            done
+          ' sh {} +
+
+  # Job 3: Unit Tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    strategy:
+      matrix:
+        node-version: ['18.x', '20.x']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:unit -- --verbose
+
+      - name: Generate coverage report
+        run: npm run test:coverage -- --coverageReporters=lcov
+
+      - name: Upload coverage to Codecov
+        if: matrix.node-version == '18.x'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+          flags: unit-tests
+          name: unit-tests-coverage
+
+  # Job 4: Integration Tests  
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run integration tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          TEST_TIMEOUT: 30000
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: integration-test-results
+          path: |
+            coverage/
+            test-results/
+
+  # Job 5: Performance Tests
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run performance tests
+        run: npm run test:performance
+        env:
+          NODE_ENV: test
+
+      - name: Check memory usage
+        run: |
+          echo "Memory usage during tests:"
+          node -e "
+            const used = process.memoryUsage();
+            for (let key in used) {
+              console.log(\`\${key}: \${Math.round(used[key] / 1024 / 1024 * 100) / 100} MB\`);
+            }
+          "
+
+  # Job 6: Security Tests
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [unit-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run security-focused tests
+        run: npm run test:security
+        env:
+          NODE_ENV: test
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "Scanning for potential secrets..."
+          grep -r --include="*.js" --include="*.json" --exclude-dir=node_modules \
+            -E "(password|secret|key|token).*[=:]\s*['\"][^'\"]{10,}" . || echo "No hardcoded secrets found"
+
+  # Job 7: End-to-End Tests
+  e2e-tests:
+    name: End-to-End Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [integration-tests, performance-tests, security-tests]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run end-to-end tests
+        run: npm run test:e2e
+        env:
+          NODE_ENV: test
+          TEST_TIMEOUT: 45000
+
+      - name: Generate test report
+        if: always()
+        run: |
+          echo "# Test Execution Summary" > test-summary.md
+          echo "- **Date**: $(date)" >> test-summary.md
+          echo "- **Branch**: ${{ github.ref_name }}" >> test-summary.md
+          echo "- **Commit**: ${{ github.sha }}" >> test-summary.md
+          echo "- **Node Version**: ${{ env.NODE_VERSION }}" >> test-summary.md
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: e2e-test-results
+          path: |
+            test-summary.md
+            coverage/
+            screenshots/
+            logs/
+
+  # Job 8: Build and Package Validation
+  build-validation:
+    name: Build & Package Validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [code-quality]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate package structure
+        run: |
+          echo "Validating package structure..."
+          [ -f package.json ] || exit 1
+          [ -f package-lock.json ] || exit 1
+          [ -d src ] || exit 1
+          [ -d tests ] || exit 1
+
+      - name: Test application startup
+        run: |
+          echo "Testing application startup..."
+          timeout 10s npm start || exit_code=$?
+          if [ ${exit_code:-0} -eq 124 ]; then
+            echo "Application started successfully (timeout as expected)"
+          elif [ ${exit_code:-0} -eq 1 ] && grep -q "TELEGRAM_BOT_TOKEN.*required" logs/* 2>/dev/null; then
+            echo "Application correctly requires bot token"
+          else
+            echo "Unexpected startup behavior"
+            exit 1
+          fi
+
+      - name: Validate environment configuration
+        run: |
+          echo "Validating environment configuration..."
+          [ -f .env.example ] || exit 1
+          
+          # Check that all required env vars are documented
+          required_vars="TELEGRAM_BOT_TOKEN FOOTBALL_API_KEY"
+          for var in $required_vars; do
+            if ! grep -q "$var" .env.example; then
+              echo "Missing $var in .env.example"
+              exit 1
+            fi
+          done
+
+  # Job 9: Final Quality Gate
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: [security-audit, unit-tests, integration-tests, performance-tests, security-tests, e2e-tests, build-validation]
+    if: always()
+    
+    steps:
+      - name: Check all jobs status
+        run: |
+          echo "Checking status of all previous jobs..."
+          
+          jobs_status='${{ toJson(needs) }}'
+          echo "Jobs status: $jobs_status"
+          
+          # Parse JSON and check for failures
+          if echo "$jobs_status" | grep -q '"result":"failure"'; then
+            echo "❌ Quality gate failed - some jobs failed"
+            exit 1
+          elif echo "$jobs_status" | grep -q '"result":"cancelled"'; then
+            echo "⚠️ Quality gate warning - some jobs were cancelled"
+            exit 1
+          else
+            echo "✅ Quality gate passed - all jobs succeeded"
+          fi
+
+      - name: Generate quality report
+        if: always()
+        run: |
+          echo "# Quality Gate Report" > quality-report.md
+          echo "" >> quality-report.md
+          echo "**Build Date**: $(date)" >> quality-report.md
+          echo "**Commit**: ${{ github.sha }}" >> quality-report.md
+          echo "**Branch**: ${{ github.ref_name }}" >> quality-report.md
+          echo "" >> quality-report.md
+          echo "## Job Results" >> quality-report.md
+          
+          jobs='${{ toJson(needs) }}'
+          for job in security-audit unit-tests integration-tests performance-tests security-tests e2e-tests build-validation; do
+            status=$(echo "$jobs" | grep -o "\"$job\":{[^}]*}" | grep -o '"result":"[^"]*"' | cut -d'"' -f4)
+            if [ "$status" = "success" ]; then
+              echo "- ✅ $job: PASSED" >> quality-report.md
+            else
+              echo "- ❌ $job: FAILED" >> quality-report.md
+            fi
+          done
+
+      - name: Upload quality report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-gate-report
+          path: quality-report.md
+
+  # Job 10: Notification and Cleanup
+  notify:
+    name: Notifications
+    runs-on: ubuntu-latest
+    needs: [quality-gate]
+    if: always()
+    
+    steps:
+      - name: Notify on success
+        if: needs.quality-gate.result == 'success'
+        run: |
+          echo "🎉 All quality checks passed!"
+          echo "Build is ready for deployment consideration."
+
+      - name: Notify on failure
+        if: needs.quality-gate.result != 'success'
+        run: |
+          echo "❌ Quality gate failed!"
+          echo "Please review the failed jobs and fix issues before merging."
+          
+      # Add Slack/Discord/Email notifications here if needed
+      # - name: Send Slack notification
+      #   if: always()
+      #   uses: 8398a7/action-slack@v3
+      #   with:
+      #     status: ${{ job.status }}
+      #     webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+# Configuration for automatic cleanup
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
